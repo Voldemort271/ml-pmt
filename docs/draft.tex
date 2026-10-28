@@ -1,0 +1,246 @@
+\documentclass[10pt,conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{url}
+
+\begin{document}
+
+\title{Predicting Mutant Behaviour for Fault Localization:\\
+When It Works and When It Does Not}
+
+\author{\IEEEauthorblockN{Anonymous Submission}}
+
+\maketitle
+
+\begin{abstract}
+Fault localization helps developers find the code responsible for a failing test. Mutation-based fault localization (MBFL) is often more precise than coverage-based methods because it observes how small, artificial changes to a program affect test outcomes. However, MBFL must execute every artificial change (a mutant) against the test suite, which is expensive. We ask whether this behavioural signal can be predicted instead of measured. Our approach, ML-PMT, learns from historical bugs which tests are likely to change outcome under a mutant, and uses the predicted changes to rank source lines. We evaluate on real Python bugs against coverage-based localization and real MBFL. Prediction is uneven. The model learns common pass-to-fail changes, but its signal on the rare failing-test flips does not translate into a better line ranking than SBFL. We identify two further limits: many faults have no mutant that changes a failing test, and the mutant sample often does not include the fault line. We conclude that predictive MBFL is bounded by mutation expressiveness and sampling, not only by model accuracy.
+\end{abstract}
+
+\begin{IEEEkeywords}
+fault localization, mutation testing, predictive mutation testing, empirical study, Python
+\end{IEEEkeywords}
+
+\section{Introduction}
+
+Fault localization (FL) techniques rank program entities, such as source lines, by their likelihood of containing a defect. Spectrum-based fault localization (SBFL) is popular because it needs only one test run. It records which lines each test executes, called coverage, and compares the coverage of failing and passing tests using formulas such as Tarantula \cite{b1} or Ochiai \cite{b2}. SBFL is cheap and often effective \cite{b7}. Its weakness is that coverage is a coarse signal: when failing tests execute most of a file, many lines receive similar scores.
+
+Mutation-based fault localization (MBFL) adds a behavioural signal \cite{b3,b4}. A mutant is a copy of the program with one small syntactic change, such as replacing \texttt{+} with \texttt{-}. MBFL creates many mutants and runs the test suite on each. A line is suspicious if its mutants change the outcomes of failing tests. This signal can be more precise, but it requires hundreds of suite runs per bug (about 275 mutants on average).
+
+This paper asks whether the behavioural signal can be predicted rather than measured. Our approach, ML-PMT, trains a classifier on historical bugs. Each training example is a source version, a mutant, and a test, labelled by whether the test's pass/fail result changes. At inference, ML-PMT runs the unmutated program once for coverage, generates candidate mutants without executing them, predicts which tests would change outcome, and ranks lines. Lines whose mutants are predicted to disturb failing tests are considered suspicious.
+
+Our results are mixed. Prediction is uneven: the model learns common pass-to-fail changes, but its signal on the failing-test flips that drive localization is weaker and does not improve line ranking. The benefit is also limited by two factors a better classifier cannot fix: (i) many faults have no mutant that changes a failing test, and (ii) the mutant sample often misses the fault line. We call these properties \emph{expressiveness} and \emph{sampling coverage}. We contribute a reproducible Python pipeline, a leave-one-bug-out study with SBFL, real MBFL, and hybrid baselines, and an analysis that separates expressiveness, sampling, and prediction quality.
+
+\section{Background and Related Work}
+
+\subsection{Coverage-Based and Mutation-Based Localization}
+
+An SBFL spectrum records, for each line $l$, four counts. Let $a$ be the number of failing tests that cover $l$, $b$ the number of passing tests that cover $l$, $c$ the number of failing tests that do not cover $l$, and $d$ the number of passing tests that do not cover $l$. Ochiai \cite{b2} scores $a/\sqrt{(a+b)(a+c)}$; Tarantula \cite{b1} compares the fraction of failing tests that cover $l$ with the fraction of passing tests that cover $l$. Both are inexpensive and competitive \cite{b7}.
+
+MBFL replaces coverage with mutation behaviour. Moon et al. \cite{b3} localize using mutants that are killed by tests, and Metallaxis \cite{b4} applies an SBFL-style formula to mutated and unmutated outcomes. The signal is richer but cost grows with the number of mutants. Mutation testing has a large body of cost-reduction work \cite{b5,b6}; our focus is to predict its effect on individual tests.
+
+\subsection{Predictive and Learned Localization}
+
+Predictive mutation testing \cite{b8} learns whether a mutant is killed without executing it, often to prioritize or skip mutants. Our target is different, as we predict the \emph{per-test} outcome change, because a line score depends on which tests change. Learning-based FL has used coverage and spectra as inputs, for example DeepFL \cite{b9}. ML-PMT conditions on mutation-site features and uses coverage as context. BugsInPy \cite{b11} and Defects4J \cite{b10} provide real faults; we use BugsInPy because our analysis targets Python.
+
+\section{Approach}
+
+\subsection{Overview}
+
+Figure~\ref{fig:pipeline} shows the pipeline. Training is offline and one-time. We take historical buggy programs and their tests, generate mutants, execute them, label each test--mutant pair, and train a pair model. In the inference step, we run the unmutated program once for coverage, generate candidate mutants without executing them, predict per-test outcome changes, and rank lines. No candidate mutant is executed at inference.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{mlpmt_pipeline.png}
+\caption{ML-PMT pipeline. Training is one-time and uses real mutant executions. Inference reuses the trained model and does not execute candidate mutants.}
+\label{fig:pipeline}
+\end{figure*}
+
+\subsection{Mutants, Execution, and Labels}
+
+We generate mutants with LibCST \cite{b12}, an open-source library that parses Python into a tree that preserves formatting. Our engine implements 19 families of syntactic changes, including arithmetic and relational operators, boolean conditions, literals, strings and regular expressions, argument order, and return values. Operators are attributed to the line of the changed token, so a multi-line expression localizes to the changed operand or connective. Mutants that serialize to the original or duplicate an earlier mutant are discarded.
+
+We mutate files changed by the historical fix and sample at most 300--400 mutants per file: first one per mutatable line, then additional mutants per line. Sampling does not use fault locations. Each mutant runs in a disposable sandbox with a fixed hash seed; tests run twice and unstable results are dropped. A pair is labelled 1 when a test's pass/fail result differs between the faulty program and the mutant. A failing test that remains failing is 0, because the mutation did not change the observable outcome. Only flips carry signal.
+
+\subsection{Pair Model and Features}
+
+Each row contains seven features: mutation type, mutated operator, replacement operator, the depth of the changed node in the abstract syntax tree (AST), the parent node type, whether the test covers the mutated line, and baseline outcome. Test identifiers are excluded to prevent memorization. Categorical features are ordinally encoded; numeric features pass through. The classifier is a gradient-boosted tree model \cite{b13}, which combines many small decision trees. We use inverse-class-frequency weights because positive changes are rare.
+
+\subsection{From Pair Probabilities to Line Scores}
+
+Let $q_{m,t}$ be the predicted probability that test $t$ changes outcome under mutant $m$. Multiple mutants on a line are collapsed per test by their mean, $q_{l,t}=\frac{1}{|M_l|}\sum_{m\in M_l}q_{m,t}$, which avoids letting a densely mutated line dominate through mutant count. Let $F$ be the number of failing baseline tests, $T_F$ the set of failing tests, and $T_P$ the set of passing tests. Define the failing-test mass $f_l=\sum_{t\in T_F}q_{l,t}$ and the passing-test mass $p_l=\sum_{t\in T_P}q_{l,t}$. The suspiciousness of line $l$ is
+\begin{equation}
+S(l)=\frac{f_l}{\sqrt{F\,(f_l+p_l)}}.
+\label{eq:score}
+\end{equation}
+This is the Metallaxis adaptation of Ochiai with real flips replaced by predicted probabilities. Passing-test flips reduce a line's score. Mean is the pipeline default; because MBFL-real uses max over mutants, we also evaluate max and report both. The max advantage is not reliable per bug (Section~\ref{sec:results}).
+
+We also evaluate a two-stage ranker. Stage 1 is the pair model; Stage 2 collapses its predictions into line features (failing and passing mass, mutant count, coverage, maximum and mean predicted probabilities, the fraction of high-probability pairs, and SBFL scores) and learns the probability that a line is faulty. It uses nested leave-one-bug-out: each training bug's features come from a pair model that has not seen that bug. Without nesting, the ranker trains on unrealistically clean in-sample predictions and its accuracy is inflated.
+
+\subsection{Baselines and Hybrid}
+
+SBFL-Ochiai and SBFL-Tarantula rank every covered line in the fault files. MBFL-real uses the same mutants as ML-PMT but replaces $q_{m,t}$ with the executed flip label. The hybrid scales SBFL-Ochiai and predicted mutation scores to $[0,1]$, takes their maximum over the full covered line set, and therefore keeps a coverage score for lines without mutants.
+
+\section{Study Design}
+
+We ask four questions.
+\begin{enumerate}
+    \item \textbf{RQ1:} Can a model predict per-test outcome changes on unseen bugs?
+    \item \textbf{RQ2:} Does the predicted signal improve line ranking over SBFL and real MBFL? 
+    \item \textbf{RQ3:} When does the signal help, and do expressiveness and sampling explain the difference?
+    \item \textbf{RQ4:} What execution cost does ML-PMT incur?
+\end{enumerate}
+
+We use 39 bugs from BugsInPy \cite{b11} across \texttt{tqdm}, \texttt{thefuck}, and \texttt{black}, each with a buggy and fixed version (78 versions). These three low-dependency projects were chosen because their suites run on Python 3.11; this is a convenience sample. Fault lines come from the fix diff: every line removed or changed by the fix is a known fault line, and a bug is found if any fault line is ranked. We keep only bug-related failing tests (fail on buggy, pass on fixed) plus up to six sampled passing tests. We attempted 40 bugs, but \texttt{black-21} was excluded because it had no bug-related failing test.
+
+Table~\ref{tab:corpus} summarizes the corpus. \texttt{Tests/ver} is the unweighted mean and \texttt{flip rate} is the pair-level positive rate. The last three columns count bugs at three levels of mutation availability: a fault line is \emph{mutatable} if our operators can change it, \emph{sampled} if the corpus contains a mutant on it, and \emph{flipping} if a sampled mutant changes a failing test. A model cannot rank a fault line that the mutation process never reaches.
+
+\begin{table*}[t]
+\centering
+\caption{Benchmark corpus and mutation availability}
+\label{tab:corpus}
+\footnotesize
+\begin{tabular}{lrrrrrrr|rrr}
+\toprule
+Project & Bugs & Versions & Pairs & Mutants & Fault lines & Tests/ver & Flip rate & Mutatable & Sampled & Flipping \\
+\midrule
+tqdm & 7 & 14 & 113,709 & 6,332 & 24 & 13.3 & 0.123 & 7 & 6 & 1 \\
+thefuck & 16 & 32 & 54,079 & 5,831 & 39 & 8.4 & 0.232 & 16 & 16 & 8 \\
+black & 16 & 32 & 68,225 & 9,453 & 248 & 7.1 & 0.119 & 16 & 7 & 1 \\
+\midrule
+\textbf{Total} & 39 & 78 & 236,013 & 21,616 & 311 & 8.7 & 0.147 & 39 & 29 & 10 \\
+\bottomrule
+\end{tabular}
+
+\vspace{2mm}
+\parbox{0.8\textwidth}{\footnotesize
+\textit{Note:} \texttt{Mutatable}, \texttt{Sampled}, and \texttt{Flipping} count bugs; across fault lines the counts are 220, 88, and 11. The 14.7\% flip rate includes fixed versions; the buggy-only rate is 10.2\%.
+}
+
+\end{table*}
+
+An anonymized artifact containing the corpus, scripts, per-bug results, Top-5 scores, and best/worst rank bounds is available at \url{https://anonymous.4open.science/r/ml-pmt-artifact-F92D/}. Every bug is held out with both its buggy and fixed versions removed from training. We focus on Top-1 and mean reciprocal rank (MRR), the average of $1/\text{rank}$. Because many lines tie, we report a tie-aware mid-rank: when $k$ lines share a score, the line's rank is the average of its best and worst positions. Mid-rank MRR is not the expected reciprocal rank. Mutation-only methods rank only mutant-bearing lines, and an unranked fault line receives $n+1$; SBFL ranks the full covered universe. Paired comparisons bootstrap over bugs. A bug is \emph{flipping} if some fault-line mutant changes at least one failing baseline test.
+
+The corpus build is deterministic: sampling uses a seed derived from the version and file, mutants run in disposable sandboxes with a fixed \texttt{PYTHONHASHSEED}, and unstable cells are dropped. The build takes roughly 7--8 hours on four workers. The analysis uses Python 3.11/3.12, scikit-learn 1.9.1, and pandas 3.0.6.
+
+\section{Results}
+\label{sec:results}
+
+\subsection{RQ1: Prediction Is Uneven Across Test Types}
+
+Table~\ref{tab:prediction} reports leave-one-bug-out prediction quality on the 39 buggy versions (117,124 pairs; 10.2\% positive). The 14.7\% in Table~\ref{tab:corpus} includes fixed versions. Overall, the full model reaches AUC 0.777 and AP 0.469. This aggregate is dominated by the common case in which a passing test starts failing. Localization instead depends on the rarer opposite case: a failing test starts passing, because only those flips contribute to $f_l$ in Eq.~\eqref{eq:score}.
+
+On failing-test pairs (54,433 pairs, 1,797 positives), the pooled AUC is 0.264 and AP 0.022, while coverage alone reaches AUC 0.595. The pooled value is misleading, however: only 12 of 39 bugs have both classes, and on those bugs the per-bug AUC is 0.714 on average (median 0.710). The pooled AUC is dominated by between-bug score shifts, not by within-bug inversion. Training a failing-only model gives pooled AUC 0.306 and per-bug mean 0.635, so target-specific training does not close the gap.
+
+Raw probabilities are miscalibrated: the full model's Brier score is 0.123, whereas a constant predictor at the 10.2\% buggy-only base rate achieves 0.091. Isotonic and Platt calibration reduce Brier to 0.071 and 0.070, with overall AUC 0.771 and 0.768; line ranking still uses the raw scores. The coverage+baseline tree underperforms raw coverage (0.712 vs. 0.754), so we use raw coverage as the baseline.
+
+\begin{table}[t]
+\centering
+\caption{Leave-one-bug-out prediction quality on the buggy versions only (117,124 pairs; 10.2\% positive).}
+\label{tab:prediction}
+\footnotesize
+\begin{tabular}{lrrrrr}
+\toprule
+Configuration & AUC & AP & Failing AUC & Failing AP & Brier \\
+\midrule
+Full model & 0.777 & 0.469 & 0.264 & 0.022 & 0.123 \\
+Without coverage & 0.705 & 0.247 & 0.238 & 0.020 & 0.176 \\
+Coverage + baseline & 0.712 & 0.275 & 0.221 & 0.025 & 0.131 \\
+Coverage only & 0.754 & 0.216 & 0.595 & 0.043 & -- \\
+\bottomrule
+\end{tabular}
+
+\vspace{2mm}
+\parbox{0.95\columnwidth}{\footnotesize
+\textit{Note:} Failing columns are pooled; per-bug mean AUC is 0.714 on the 12 bugs with both classes. Constant Brier is 0.091; isotonic/Platt calibration gives 0.071/0.070.
+}
+\end{table}
+
+\subsection{RQ2 and RQ3: Expressiveness and Sampling Bound the Gain}
+
+Only 10 of 39 bugs have a fault-line mutant that flips a failing test. But this does not mean the other 29 faults are inexpressible. All 39 bugs have at least one mutatable fault line, and 29 have at least one sampled fault-line mutant. Ten bugs (mostly \texttt{black}) are sampling-limited in this corpus: their fault lines are mutatable but no sampled mutant reaches them. Whether they would flip under unsampled mutants is unknown, so we treat them as unsampled rather than proven inexpressible. The remaining 19 have a sampled fault-line mutant, but none flips a failing test.
+
+Table~\ref{tab:localization} reports tie-aware localization. Under mid-rank, no method dominates. ML-PMT with max aggregation reaches MRR 0.340, the two-stage ranker 0.339, SBFL-Tarantula 0.334, SBFL-Ochiai 0.313, the hybrid 0.291, and MBFL-real 0.246. The ML-PMT minus SBFL-Tarantula difference is +0.007 (95\% CI [$-0.078$, $+0.089$]), so the two are not separable overall. The original line-number tie-break gave SBFL-Tarantula 0.454 and MBFL-real 0.314; most of that difference comes from ties, not from better ranking. MBFL-real's three Top-1 hits on non-flipping bugs (\texttt{thefuck-6}, \texttt{thefuck-31}, and \texttt{thefuck-32}) are all zero-score ties at the fault line. An MBFL+SBFL fallback, which uses SBFL to break zero-score ties, reaches MRR 0.312 and Top-1 0.256: better than MBFL alone but below ML-PMT and SBFL. We therefore do not claim that SBFL is the strongest method overall.
+
+On the 10 flipping bugs, real MBFL leads with MRR 0.784, followed by the two-stage ranker 0.654, SBFL-Ochiai 0.573, and ML-PMT 0.541. This subset is exploratory: 8 of the 10 bugs are from \texttt{thefuck}, and the +0.211 comparison is against SBFL-Ochiai. MBFL exceeds SBFL-Ochiai by +0.211 (95\% CI [$+0.047$, $+0.417$]) and ML-PMT by +0.243 ([$+0.070$, $+0.446$]). On the 29 non-flipping bugs, ML-PMT with max aggregation reaches 0.271, SBFL-Ochiai 0.223, and MBFL 0.061. Real MBFL helps only when a fault-line mutant can flip a failing test.
+
+The aggregation rule also changes the result: max reaches MRR 0.340 versus 0.309 for mean on ML-PMT, and 0.246 versus 0.230 on MBFL-real. The max advantage is not reliable per bug: max wins on 7 bugs, mean on 5, and 27 tie (paired 95\% CI [$-0.005$, $+0.083$]). We therefore report both and do not treat max as a settled default. A learned ranker using the same random forest but only coverage and SBFL line features, with no mutation predictions, reaches MRR 0.288. This is below the two-stage ranker’s 0.339; a paired bootstrap gives +0.052 [0.000, 0.120], but the two runs use different tie policies and feature sets, so this is not a controlled ablation and does not establish a reliable mutation advantage.
+
+\begin{table}[t]
+\centering
+\caption{Tie-aware fault localization}
+\label{tab:localization}
+\footnotesize
+\begin{tabular}{lrr}
+\toprule
+Method & Top-1 & MRR (mid) \\
+\midrule
+ML-PMT (max) & 0.256 & \textbf{0.340} \\
+ML-PMT two-stage & 0.256 & 0.339 \\
+SBFL-Tarantula & 0.231 & 0.334 \\
+SBFL-Ochiai & 0.205 & 0.313 \\
+MBFL-real & 0.154 & 0.246 \\
+\bottomrule
+\end{tabular}
+
+\vspace{1mm}
+\parbox{0.95\columnwidth}{\footnotesize
+\textit{Note:} Top-1 requires a unique top; MRR uses mid-rank. Mutation-only methods rank only mutant-bearing lines; unranked faults get $n+1$.
+}
+\end{table}
+
+\subsection{RQ4: Execution Cost}
+
+The current prototype uses two runs (baseline and coverage), measured as 17.5 test executions per bug; a combined runner would use 8.7. Full MBFL-real needs 275 mutant suite runs and about 3,003 test executions per bug. Restricting MBFL to failing tests and tests covering the mutated line reduces this to about 1,910. A cheaper 20--30 mutant MBFL needs 175--262 test executions, i.e., 20--30 times the one-run figure (10--15 times the measured two-run figure), not two orders of magnitude. Mutant generation was 15.9 seconds at a 60-mutant cap; scaling linearly gives about 70 seconds at 275 mutants. We therefore claim an execution-count advantage, not a wall-clock advantage. A suite run executes the selected suite once for one mutant; a test execution runs one test for one mutant.
+
+\section{Discussion and Future Work}
+
+The results separate three concerns. \emph{Prediction quality} is uneven and does not translate into better ranking; a better classifier cannot compensate for \emph{expressiveness} or \emph{sampling}. Expressiveness determines whether a fault line can produce any mutation signal, and sampling determines whether the mutation process reaches it. An inference-time gate remains future work.
+
+Tie handling is a validity issue: with many equal scores, a line-number tie-break can turn a tie into a Top-1 hit. Future studies should report tie-aware metrics and rank bounds.
+
+We plan to expand operators for algorithmic and multi-line faults, test failing-test-covered sampling, run exhaustive mutation for the 29 unsampled or non-flipping bugs, compare with an external Python mutator, and use multiple seeds and cluster-robust intervals.
+
+\section{Threats to Validity}
+
+Fault lines are derived from fix diffs, not from a causal analysis. A multi-line fix can contain unrelated edits, and one bug contributes 178 fault lines; counting a bug as found if any line is ranked is generous. Pure additions are not mapped to buggy lines, so addition-only fixes are absent; this removes omission faults that mutation cannot express and therefore biases the study in favor of mutation. Tests are a selected subset (all bug-related failing tests plus up to six passing tests), which keeps the study tractable but makes the suites smaller than the original projects; a full-passing-set sensitivity run remains future work, and heavy SBFL ties may partly reflect this selection. The study covers three Python projects and 39 bugs. The rates of expressiveness and sampling are properties of this operator set and this selection. Each configuration uses one deterministic seed, and the flipping subset has only ten bugs, so intervals are wide. Finally, our outcome-change label excludes fail-to-fail mutants, unlike the standard kill definition, so the numbers are not directly comparable to all published MBFL results.
+
+\section{Conclusion}
+
+We asked whether per-test mutant outcomes can be predicted well enough to give MBFL's behavioural signal at SBFL-like execution cost. The answer is conditional. The model learns common pass-to-fail changes and has within-bug signal on failing-test flips, but this signal does not improve line ranking over SBFL. Only a minority of faults are observed to be expressible, and a further group is lost to sampling. Under tie-aware scoring, no method dominates; the mutation signal helps mainly on the faults that can produce it. Predictive MBFL is therefore not a drop-in replacement for SBFL. It is a targeted tool whose value depends on mutation expressiveness and sampling coverage, and those properties should be measured before the model is trusted.
+
+\begin{thebibliography}{00}
+
+\bibitem{b1} J. A. Jones, M. J. Harrold, and J. Stasko, ``Visualization of test information to assist fault localization,'' in \emph{Proc. ICSE}, 2002, pp. 467--477.
+
+\bibitem{b2} R. Abreu, P. Zoeteweij, and A. J. C. van Gemund, ``On the accuracy of spectrum-based fault localization,'' in \emph{Proc. TAIC PART}, 2007, pp. 89--98.
+
+\bibitem{b7} W. E. Wong, R. Gao, Y. Li, R. Abreu, and F. Wotawa, ``A survey on software fault localization,'' \emph{IEEE Trans. Software Eng.}, vol. 42, no. 8, pp. 707--740, 2016.
+
+\bibitem{b3} S. Moon, Y. Kim, M. Kim, and S. Yoo, ``Ask the mutants: Mutating faulty programs for fault localization,'' in \emph{Proc. ICSE}, 2014, pp. 153--164.
+
+\bibitem{b4} M. Papadakis and Y. Le Traon, ``Metallaxis-FL: Mutation-based fault localization,'' \emph{Software Testing, Verification and Reliability}, vol. 25, no. 5--7, pp. 605--628, 2015.
+
+\bibitem{b5} Y. Jia and M. Harman, ``An analysis and survey of the development of mutation testing,'' \emph{IEEE Trans. Software Eng.}, vol. 37, no. 5, pp. 649--678, 2011.
+
+\bibitem{b6} M. Papadakis, M. Kintis, J. Zhang, Y. Jia, Y. Le Traon, and M. Harman, ``Mutation testing advances: An analysis and survey,'' \emph{Advances in Computers}, vol. 112, pp. 275--378, 2019.
+
+\bibitem{b8} J. Zhang, Z. Wang, L. Zhang, D. Hao, L. Zang, and L. Zhang, ``Predictive mutation testing,'' \emph{IEEE Trans. Software Eng.}, vol. 45, no. 9, pp. 898--918, 2019.
+
+\bibitem{b9} X. Li, W. Li, Y. Zhang, and L. Zhang, ``DeepFL: Integrating multiple fault diagnosis dimensions for deep fault localization,'' in \emph{Proc. ISSTA}, 2019, pp. 169--180.
+
+\bibitem{b11} R. Widyasari, S. Q. Sim, C. Lok, H. Qi, J. Phan, Q. Tay, C. Tan, F. Wee, J. Tan, E. L. Ouh, and D. Lo, ``BugsInPy: A database of existing bugs in Python programs to enable controlled testing and debugging studies,'' in \emph{Proc. ESEC/FSE}, 2020, pp. 1556--1560.
+
+\bibitem{b10} R. Just, D. Jalali, and M. D. Ernst, ``Defects4J: A database of existing faults to enable controlled testing studies for Java programs,'' in \emph{Proc. ISSTA}, 2014, pp. 437--440.
+
+\bibitem{b12} Meta Open Source, ``LibCST: A concrete syntax tree parser for Python.'' [Online]. Available: https://github.com/Instagram/LibCST
+
+\bibitem{b13} F. Pedregosa et al., ``Scikit-learn: Machine learning in Python,'' \emph{Journal of Machine Learning Research}, vol. 12, pp. 2825--2830, 2011.
+
+\end{thebibliography}
+
+\end{document}

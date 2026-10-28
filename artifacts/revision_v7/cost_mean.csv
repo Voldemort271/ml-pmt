@@ -1,0 +1,2 @@
+tests,mutants,mbfl_full_test_executions,mbfl_covering_test_executions,mlpmt_one_run_test_executions,mlpmt_two_runs_test_executions,sbfl_test_executions,mbfl_suite_runs,mlpmt_suite_runs,sbfl_suite_runs,mbfl_20_suite_runs,mbfl_20_test_executions,mbfl_30_suite_runs,mbfl_30_test_executions
+8.743589743589743,274.94871794871796,3003.1794871794873,1910.1538461538462,8.743589743589743,17.487179487179485,8.743589743589743,274.94871794871796,1.0,1.0,20.0,174.87179487179486,30.0,262.3076923076923

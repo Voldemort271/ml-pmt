@@ -1,0 +1,705 @@
+"""Build a historical training corpus from a small BugsInPy slice."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import pickle
+import random
+import re
+import shutil
+import sys
+import time
+from collections import Counter
+from pathlib import Path
+
+import pandas as pd
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from execution.pytest_runner import coverage_by_test_file, run_pytest
+from features.extractor import node_metadata
+from mutation_engine.generator import generate_mutants
+
+WORK = ROOT / "benchmarks" / "work"
+BUGS_ROOT = ROOT / "benchmarks" / "BugsInPy" / "projects"
+
+BUGS = [
+    {"project": "tqdm", "bug": 1, "venv": "tqdm_1", "packages": ["tqdm"], "max_mutants": 400},
+    {"project": "tqdm", "bug": 2, "venv": "tqdm_1", "packages": ["tqdm"], "max_mutants": 400},
+    {"project": "tqdm", "bug": 4, "venv": "tqdm_1", "packages": ["tqdm"], "max_mutants": 400},
+    {"project": "tqdm", "bug": 5, "venv": "tqdm_1", "packages": ["tqdm"], "max_mutants": 400},
+    {"project": "tqdm", "bug": 6, "venv": "tqdm_1", "packages": ["tqdm"], "max_mutants": 400},
+    {"project": "tqdm", "bug": 8, "venv": "tqdm_1", "packages": ["tqdm"], "max_mutants": 400},
+    {"project": "tqdm", "bug": 9, "venv": "tqdm_1", "packages": ["tqdm"], "max_mutants": 400},
+    {"project": "thefuck", "bug": 1, "venv": "thefuck_5", "packages": ["thefuck"]},
+    {"project": "thefuck", "bug": 2, "venv": "thefuck_5", "packages": ["thefuck"]},
+    {"project": "thefuck", "bug": 5, "venv": "thefuck_5", "packages": ["thefuck"]},
+    {"project": "thefuck", "bug": 6, "venv": "thefuck_5", "packages": ["thefuck"]},
+    {"project": "thefuck", "bug": 7, "venv": "thefuck_5", "packages": ["thefuck"]},
+    {"project": "thefuck", "bug": 8, "venv": "thefuck_5", "packages": ["thefuck"]},
+    {"project": "thefuck", "bug": 13, "venv": "thefuck_5", "packages": ["thefuck"]},
+    {"project": "thefuck", "bug": 15, "venv": "thefuck_5", "packages": ["thefuck"]},
+    {"project": "thefuck", "bug": 25, "venv": "thefuck_5", "packages": ["thefuck"]},
+    {"project": "thefuck", "bug": 26, "venv": "thefuck_5", "packages": ["thefuck"]},
+    {"project": "thefuck", "bug": 27, "venv": "thefuck_5", "packages": ["thefuck"]},
+    {"project": "thefuck", "bug": 28, "venv": "thefuck_5", "packages": ["thefuck"]},
+    {"project": "thefuck", "bug": 29, "venv": "thefuck_5", "packages": ["thefuck"]},
+    {"project": "thefuck", "bug": 30, "venv": "thefuck_5", "packages": ["thefuck"]},
+    {"project": "thefuck", "bug": 31, "venv": "thefuck_5", "packages": ["thefuck"]},
+    {"project": "thefuck", "bug": 32, "venv": "thefuck_5", "packages": ["thefuck"]},
+    {"project": "black", "bug": 4, "venv": "black_4", "packages": ["black", "blib2to3"]},
+    {"project": "black", "bug": 5, "venv": "black_4", "packages": ["black", "blib2to3"]},
+    {"project": "black", "bug": 6, "venv": "black_4", "packages": ["black", "blib2to3"]},
+    {"project": "black", "bug": 7, "venv": "black_4", "packages": ["black", "blib2to3"]},
+    {"project": "black", "bug": 8, "venv": "black_4", "packages": ["black", "blib2to3"]},
+    {"project": "black", "bug": 9, "venv": "black_4", "packages": ["black", "blib2to3"]},
+    {"project": "black", "bug": 10, "venv": "black_4", "packages": ["black", "blib2to3"]},
+    {"project": "black", "bug": 11, "venv": "black_4", "packages": ["black", "blib2to3"]},
+    {"project": "black", "bug": 12, "venv": "black_4", "packages": ["black", "blib2to3"]},
+    {"project": "black", "bug": 13, "venv": "black_4", "packages": ["black", "blib2to3"]},
+    {"project": "black", "bug": 15, "venv": "black_4", "packages": ["black", "blib2to3"]},
+    {"project": "black", "bug": 16, "venv": "black_4", "packages": ["black", "blib2to3"]},
+    {"project": "black", "bug": 17, "venv": "black_4", "packages": ["black", "blib2to3"]},
+    {"project": "black", "bug": 18, "venv": "black_4", "packages": ["black", "blib2to3"]},
+    {"project": "black", "bug": 20, "venv": "black_4", "packages": ["black", "blib2to3"]},
+    {"project": "black", "bug": 21, "venv": "black_4", "packages": ["black", "blib2to3"]},
+    {"project": "black", "bug": 23, "venv": "black_4", "packages": ["black", "blib2to3"]},
+]
+
+# Test-infrastructure patches required to run old test suites on modern pytest.
+CONFTEST_PATCH = "request.node.get_marker('functional')"
+CONFTEST_REPLACEMENT = "request.node.get_closest_marker('functional')"
+
+# ``inspect.getargspec`` was removed in Python 3.11; some thefuck commits import
+# it at module scope. ``getfullargspec`` exposes the same ``.args`` attribute.
+GETARGSPEC_PATCH = "from inspect import getargspec"
+GETARGSPEC_REPLACEMENT = "from inspect import getfullargspec as getargspec"
+
+_STABLE_MAX_ATTEMPTS = 3
+
+# Passing tests kept per bug (failing tests are all kept). A deterministic
+# random sample is drawn from the passing pool rather than the first N in
+# junitxml order, so the selection is not biased toward early test files.
+_PASSING_CAP = 6
+
+HUNK_RE = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+TARGET_RE = re.compile(r"::([\w]+)")
+
+
+def _stable_seed(*parts: str) -> int:
+    """Deterministic, fault-independent seed for reproducible mutant sampling."""
+    digest = hashlib.sha256("::".join(parts).encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big")
+
+
+def _sample_mode() -> str:
+    """Mutation-sampling mode. Stratified (one candidate per line) by default;
+    override with ``MLPMT_SAMPLE_MODE=uniform`` (fault-agnostic shuffle) or
+    ``MLPMT_SAMPLE_MODE=coverage_floor`` (failing-test-covered lines first) in
+    the environment."""
+    return os.environ.get("MLPMT_SAMPLE_MODE", "stratified_floor")
+
+
+def prepare_checkout(checkout: Path, project: str) -> None:
+    """Apply any test-infra patches needed to run the suite on this pytest."""
+    if project == "thefuck":
+        conftest = checkout / "tests" / "conftest.py"
+        if conftest.exists():
+            text = conftest.read_text()
+            if CONFTEST_PATCH in text:
+                conftest.write_text(text.replace(CONFTEST_PATCH, CONFTEST_REPLACEMENT))
+        utils = checkout / "thefuck" / "utils.py"
+        if utils.exists():
+            text = utils.read_text()
+            if GETARGSPEC_PATCH in text:
+                utils.write_text(text.replace(GETARGSPEC_PATCH, GETARGSPEC_REPLACEMENT))
+
+
+def make_sandbox(checkout: Path, name: str, project: str) -> Path:
+    """Copy a checkout into a disposable sandbox for in-place mutant runs.
+
+    The source checkout is never mutated, so a killed build cannot corrupt it.
+    """
+    target = WORK / "_sandbox" / name
+    if target.exists():
+        shutil.rmtree(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    ignore = shutil.ignore_patterns(
+        ".git",
+        ".coverage",
+        ".pytest_cache",
+        "__pycache__",
+        "*.pyc",
+        "venv",
+        ".venv",
+    )
+    shutil.copytree(
+        checkout,
+        target,
+        ignore=ignore,
+        symlinks=True,
+    )
+    prepare_checkout(target, project)
+    return target
+
+
+def read_info(bug_dir: Path) -> dict:
+    info = {}
+    for line in (bug_dir / "bug.info").read_text().splitlines():
+        if "=" in line:
+            key, _, value = line.partition("=")
+            info[key.strip()] = value.strip().strip('"')
+    return info
+
+
+def fault_lines(patch_text: str) -> dict[str, list[int]]:
+    """Map file -> buggy line numbers the fix removes or changes."""
+    result: dict[str, list[int]] = {}
+    current_file = None
+    old_line = None
+    for line in patch_text.splitlines():
+        if line.startswith("diff --git"):
+            match = re.match(r"diff --git a/(\S+) b/", line)
+            current_file = match.group(1)
+            result[current_file] = []
+        elif line.startswith("@@"):
+            match = HUNK_RE.match(line)
+            old_line = int(match.group(1))
+        elif line.startswith("-") and not line.startswith("---"):
+            if current_file is not None and old_line is not None:
+                result[current_file].append(old_line)
+                old_line += 1
+        elif line.startswith("+") and not line.startswith("+++"):
+            pass
+        elif line.startswith(" ") or line.startswith("\\"):
+            if old_line is not None:
+                old_line += 1
+    return {f: lines for f, lines in result.items() if lines}
+
+
+def select_tests(
+    checkout: Path,
+    bug_dir: Path,
+    python: Path,
+    *,
+    fixed_checkout: Path | None = None,
+) -> tuple[list[str], list[str]]:
+    """Return concrete test nodeids and the bug-related failing subset.
+
+    When ``fixed_checkout`` is given, a test counts as *bug-related failing*
+    only if it fails on the buggy version and passes on the fixed version;
+    tests that fail on both are environment/version noise and are excluded.
+    Without it (diagnostic callers), every failing test is kept.
+
+    The passing set is a deterministic random sample (not the first N in
+    junitxml order), so it is not biased toward early test files.
+
+    ``test_file`` may be semicolon-separated (a test module plus data files);
+    only non-``/data/`` ``.py`` modules are run.
+    """
+    info = read_info(bug_dir)
+    test_modules = _test_modules(info["test_file"])
+    if not test_modules:
+        raise RuntimeError(f"No test module in test_file for {bug_dir}")
+
+    buggy: dict[str, str] = {}
+    for module in test_modules:
+        buggy.update(run_pytest(checkout, [module], python))
+    if "_suite_error" in buggy:
+        raise RuntimeError(f"Test collection failed for {checkout}")
+
+    fixed: dict[str, str] = {}
+    if fixed_checkout is not None:
+        for module in test_modules:
+            fixed.update(run_pytest(fixed_checkout, [module], python))
+
+    def _passes_on_fixed(test_id: str) -> bool:
+        return fixed_checkout is None or fixed.get(test_id) == "pass"
+
+    failing = [
+        test_id
+        for test_id, result in buggy.items()
+        if result == "fail" and _passes_on_fixed(test_id)
+    ]
+    if not failing:
+        raise RuntimeError(f"No bug-related failing test on {checkout}")
+
+    passing = [
+        test_id
+        for test_id, result in buggy.items()
+        if result == "pass" and _passes_on_fixed(test_id)
+    ]
+    rng = random.Random(_stable_seed("passing", str(bug_dir)))
+    chosen = rng.sample(sorted(passing), min(_PASSING_CAP, len(passing)))
+    selected = failing + chosen
+
+    # Validate the combined nodeid list actually collects. A bug's module can
+    # collect as a whole while *some individual nodeids* (often module-level
+    # targets like ``tests.python2``) error when run in a selected list,
+    # which turns every mutant run into ``_suite_error`` and loses the bug
+    # entirely. Trim non-collectable members (prefer keeping failing ones).
+    selected = _collectable_subset(checkout, selected, python)
+    keep_failing = [tid for tid in failing if tid in set(selected)]
+    if not keep_failing:
+        raise RuntimeError(f"No collectable failing test on {checkout}")
+    return selected, keep_failing
+
+
+def _collectable_subset(
+    checkout: Path, test_ids: list[str], python: Path
+) -> list[str]:
+    """Return a subset of ``test_ids`` that pytest can collect together.
+
+    Runs the full list; on ``_suite_error`` retries by removing candidate
+    members until the list collects. Failing tests are checked first (kept);
+    if none are individually collectable, use the best-effort module set.
+    """
+    if not test_ids:
+        return []
+    run_once = run_pytest(checkout, test_ids, python)
+    if "_suite_error" not in run_once:
+        return test_ids
+
+    # Try each member alone to find the collective-error trigger.
+    collectable = []
+    for tid in set(test_ids):
+        solo = run_pytest(checkout, [tid], python)
+        if "_suite_error" not in solo:
+            collectable.append(tid)
+    if not collectable:
+        # Fall back to re-collecting the module list (already known okay).
+        return list(dict.fromkeys(test_ids))
+    # Greedy: add back members until something breaks, keep the largest
+    # prefix that still collects (deterministic order).
+    chosen: list[str] = []
+    for tid in test_ids:
+        if tid not in collectable:
+            continue
+        trial = chosen + [tid]
+        res = run_pytest(checkout, trial, python)
+        if "_suite_error" in res:
+            break
+        chosen = trial
+    return chosen or (collectable[:1] if collectable else [])
+
+
+def _test_modules(test_file: str) -> list[str]:
+    """Return the test modules from a possibly semicolon-separated test_file."""
+    return [
+        part.strip()
+        for part in test_file.split(";")
+        if part.strip().endswith(".py") and "/data/" not in part
+    ]
+
+
+def matches(test_id: str, target: str) -> bool:
+    """True when a nodeid corresponds to a (possibly parametrized) target."""
+    return (
+        test_id == target
+        or test_id.endswith("::" + target)
+        or test_id.startswith(target + "[")
+    )
+
+
+def target_tests(run_test_sh: str, test_file: str) -> list[str]:
+    """Extract target test names from pytest or unittest run commands."""
+    targets = []
+    for line in run_test_sh.splitlines():
+        if "::" in line:
+            name = TARGET_RE.search(line)
+            if name:
+                targets.append(f"{test_file}::{name.group(1)}")
+        elif "unittest" in line:
+            identifiers = re.findall(r"[A-Za-z_]\w*", line)
+            if identifiers:
+                targets.append(identifiers[-1])
+    return targets
+
+
+def _clean_sandbox_state(checkout: Path) -> None:
+    """Remove per-run state so it cannot accumulate across mutants."""
+    import shutil as _shutil
+
+    for pattern in (".thefuck", ".coverage", ".pytest_cache", "__pycache__"):
+        for match in checkout.glob(pattern):
+            if match.is_dir():
+                _shutil.rmtree(match, ignore_errors=True)
+            else:
+                match.unlink(missing_ok=True)
+    for match in checkout.rglob("*.pyc"):
+        match.unlink(missing_ok=True)
+
+
+def _stable_results(
+    checkout: Path,
+    tests: list[str],
+    python: Path,
+    max_attempts: int = _STABLE_MAX_ATTEMPTS,
+) -> tuple[dict[str, str], int]:
+    """Run a mutant's tests until two runs agree; drop per-test flakiness.
+
+    Returns ``(outcomes, attempts_used)`` where ``outcomes`` contains only the
+    tests whose result is stable across runs (tests that keep disagreeing are
+    omitted), and ``attempts_used`` is the number of pytest runs performed
+    (``max_attempts`` if the mutant never produced two consecutive identical
+    runs and fell through to vote-tallying).
+    """
+    attempts = []
+    for _ in range(max_attempts):
+        result = run_pytest(checkout, tests, python)
+        attempts.append(result)
+        if len(attempts) >= 2 and attempts[-1] == attempts[-2]:
+            return result, len(attempts)
+    stable = {}
+    for test_id in tests:
+        votes = Counter(attempt.get(test_id) for attempt in attempts)
+        outcome, count = votes.most_common(1)[0]
+        if count >= 2:
+            stable[test_id] = outcome
+    return stable, len(attempts)
+
+
+def version_pairs(
+    checkout: Path,
+    relative_file: str,
+    *,
+    tests: list[str],
+    python: Path,
+    source_packages: list[str],
+    max_mutants: int,
+    version_name: str,
+    baseline_results: dict[str, str],
+) -> tuple[list[dict], int, int]:
+    """Run all selected mutants of one file and label every test–mutant pair.
+
+    ``baseline_results`` is computed once per source version by the caller and
+    reused for every fault file, so a flaky baseline cannot disagree across the
+    files a multi-file bug spans.
+
+    Returns ``(rows, flaky_cells, ceiling_hits)`` where ``ceiling_hits`` counts
+    mutants whose stability check ran the full ``max_attempts`` because two
+    consecutive runs never agreed.
+    """
+    path = checkout / relative_file
+    original = path.read_text()
+
+    per_file_coverage = coverage_by_test_file(
+        checkout,
+        tests,
+        python,
+        source_packages=source_packages,
+    )
+    for _attempt in range(2):
+        if per_file_coverage:
+            break
+        time.sleep(10)
+        per_file_coverage = coverage_by_test_file(
+            checkout,
+            tests,
+            python,
+            source_packages=source_packages,
+        )
+    coverage = {
+        test_id: set().union(*(lines.values() if lines else []))
+        for test_id, lines in per_file_coverage.items()
+    }
+
+    # Coverage-guided sampling: when enabled, spend the mutant budget on lines
+    # covered by at least one failing test first (where a fault can actually be
+    # localized), then the rest of the file. Uses the same failing-test coverage
+    # SBFL uses, so it leaks no fault-label information.
+    mode = _sample_mode()
+    priority_lines: set[int] | None = None
+    if mode == "coverage_floor":
+        failing_tests = [t for t in tests if baseline_results.get(t) == "fail"]
+        priority_lines = set()
+        for test_id in failing_tests:
+            for file_path, lines in per_file_coverage.get(test_id, {}).items():
+                if file_path.endswith(relative_file):
+                    priority_lines.update(lines)
+
+    # Fault-agnostic sampling: a seed fixed per (version, file) keeps the
+    # retained mutant set deterministic and independent of fault locations.
+    # Stratified mode spreads the budget one-candidate-per-line, giving
+    # deterministic coverage of all lines the budget reaches.
+    mutants = generate_mutants(
+        original,
+        limit=max_mutants,
+        seed=_stable_seed(version_name, relative_file),
+        mode=mode,
+        priority_lines=priority_lines,
+    )
+    print(
+        f"  [{version_name}::{relative_file}] {len(mutants)} mutants | "
+        f"{len(tests)} tests | cap {max_mutants}",
+        flush=True,
+    )
+
+    rows: list[dict] = []
+    flaky_cells = 0
+    ceiling_hits = 0
+    for index, mutant in enumerate(mutants):
+        path.write_text(mutant["source"])
+        try:
+            mutant_results, attempts_used = _stable_results(checkout, tests, python)
+        finally:
+            path.write_text(original)
+            _clean_sandbox_state(checkout)
+        if attempts_used >= _STABLE_MAX_ATTEMPTS:
+            ceiling_hits += 1
+        flaky_cells += sum(
+            1 for test_id in tests if test_id not in mutant_results
+        )
+        if (index + 1) % 25 == 0 or index + 1 == len(mutants):
+            print(
+                f"  [{version_name}::{relative_file}] {index + 1}/{len(mutants)} "
+                f"mutants | rows so far {len(rows)} | flaky {flaky_cells}",
+                flush=True,
+            )
+        metadata = node_metadata(
+            original,
+            mutant["line"],
+            mutant["mutation_type"],
+            mutant["detail"],
+        )
+        for test_id in tests:
+            if test_id not in mutant_results:
+                continue
+            baseline_result = baseline_results.get(test_id, "fail")
+            mutant_result = mutant_results[test_id]
+            rows.append(
+                {
+                    "source_version": version_name,
+                    "mutant_id": f"{version_name}::{relative_file}::{mutant['mutant_id']}",
+                    "line_number": mutant["line"],
+                    "file": relative_file,
+                    "test_id": test_id,
+                    "mutation_type": mutant["mutation_type"],
+                    "mutated_operator": mutant["operator"],
+                    "replacement_operator": mutant["detail"],
+                    "ast_depth": metadata["ast_depth"],
+                    "parent_node_type": metadata["parent_node_type"],
+                    "test_covers_mutation": int(
+                        mutant["line"] in coverage.get(test_id, set())
+                    ),
+                    "baseline_test_result": baseline_result,
+                    "outcome_changed": int(mutant_result != baseline_result),
+                }
+            )
+    return rows, flaky_cells, ceiling_hits
+
+
+def _version_task(spec: dict, tests: list[str], is_fixed: bool, task_index: int):
+    """Build one source version's rows in its own sandbox (a parallel unit).
+
+    Results are checkpointed per task (keyed by sampling mode) so a crash or
+    restart resumes completed versions instead of redoing a multi-hour build.
+    """
+    project = spec["project"]
+    bug = spec["bug"]
+    name = f"{project}_{bug}_{'f' if is_fixed else 'b'}_{task_index}"
+    checkpoint = WORK / "_checkpoints" / _sample_mode() / f"{name}.pkl"
+    if checkpoint.exists():
+        with checkpoint.open("rb") as handle:
+            return pickle.load(handle)
+
+    max_mutants = spec.get("max_mutants", 300)
+    python = WORK / spec["venv"] / "venv" / "bin" / "python"
+    source_packages = spec["packages"]
+    bug_dir = BUGS_ROOT / project / "bugs" / str(bug)
+    checkout = WORK / f"{project}_{bug}" / project
+    fixed_checkout = WORK / f"{project}_{bug}_fixed" / project
+    sandbox = make_sandbox(
+        fixed_checkout if is_fixed else checkout, name, project
+    )
+    faults = fault_lines((bug_dir / "bug_patch.txt").read_text())
+    version_name = f"{project}-{bug}" + ("-fixed" if is_fixed else "")
+
+    # Baseline once per version (not per fault file). A transient failure under
+    # heavy parallel load is retried so one load spike cannot kill the build.
+    baseline_results = run_pytest(sandbox, tests, python)
+    for _attempt in range(2):
+        if "_suite_error" not in baseline_results:
+            break
+        time.sleep(10)
+        baseline_results = run_pytest(sandbox, tests, python)
+    if "_suite_error" in baseline_results:
+        raise RuntimeError(
+            f"[{version_name}] baseline test collection failed; tests={len(tests)}"
+        )
+
+    rows: list[dict] = []
+    fault_rows: list[dict] = []
+    flaky = 0
+    ceiling_hits = 0
+    for relative_file, lines in faults.items():
+        version_rows, version_flaky, version_ceiling = version_pairs(
+            sandbox,
+            relative_file,
+            tests=tests,
+            python=python,
+            source_packages=source_packages,
+            max_mutants=max_mutants,
+            version_name=version_name,
+            baseline_results=baseline_results,
+        )
+        rows.extend(version_rows)
+        flaky += version_flaky
+        ceiling_hits += version_ceiling
+        if not is_fixed:
+            fault_rows.extend(
+                {"source_version": version_name,
+                 "file": relative_file, "fault_line": line}
+                for line in lines
+            )
+    result = (rows, fault_rows, flaky, ceiling_hits)
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    tmp = checkpoint.with_suffix(".pkl.tmp")
+    with tmp.open("wb") as handle:
+        pickle.dump(result, handle)
+    tmp.replace(checkpoint)
+    return result
+
+
+def build_corpus(
+    out_dir: Path = ROOT / "data",
+    bugs: list[dict] | None = None,
+    *,
+    workers: int = 1,
+) -> dict:
+    rows: list[dict] = []
+    fault_rows: list[dict] = []
+    total_flaky = 0
+    total_ceiling = 0
+
+    tasks: list[tuple] = []
+    for spec in bugs or BUGS:
+        project = spec["project"]
+        bug = spec["bug"]
+        python = WORK / spec["venv"] / "venv" / "bin" / "python"
+        bug_dir = BUGS_ROOT / project / "bugs" / str(bug)
+        checkout = WORK / f"{project}_{bug}" / project
+        sandbox = make_sandbox(checkout, f"{project}_{bug}_select", project)
+        fixed_checkout = WORK / f"{project}_{bug}_fixed" / project
+        fixed_sandbox = make_sandbox(
+            fixed_checkout, f"{project}_{bug}_select_fixed", project
+        )
+        try:
+            tests, failing = select_tests(
+                sandbox, bug_dir, python, fixed_checkout=fixed_sandbox
+            )
+        except RuntimeError as exc:
+            print(f"  SKIP {project}-{bug}: {exc}", flush=True)
+            continue
+        faults = fault_lines((bug_dir / "bug_patch.txt").read_text())
+        print(
+            f"  {project} bug {bug}: {len(tests)} tests "
+            f"({len(failing)} failing: {[t.rsplit('::', 1)[-1] for t in failing]}), "
+            f"fault files {list(faults)}"
+        )
+        tasks.append((spec, tests, False, len(tasks)))
+        tasks.append((spec, tests, True, len(tasks)))
+
+    if workers > 1:
+        from concurrent.futures import ProcessPoolExecutor
+
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(_version_task, *task) for task in tasks]
+            t_start = time.monotonic()
+            for done, future in enumerate(futures, 1):
+                version_rows, version_faults, flaky, ceiling = future.result()
+                rows.extend(version_rows)
+                fault_rows.extend(version_faults)
+                total_flaky += flaky
+                total_ceiling += ceiling
+                print(
+                    f"[corpus] {done}/{len(tasks)} tasks done | "
+                    f"rows so far {len(rows)} | "
+                    f"{time.monotonic() - t_start:.0f}s elapsed",
+                    flush=True,
+                )
+    else:
+        t_start = time.monotonic()
+        for done, task in enumerate(tasks, 1):
+            version_rows, version_faults, flaky, ceiling = _version_task(*task)
+            rows.extend(version_rows)
+            fault_rows.extend(version_faults)
+            total_flaky += flaky
+            total_ceiling += ceiling
+            print(
+                f"[corpus] {done}/{len(tasks)} tasks done | "
+                f"rows so far {len(rows)} | "
+                f"{time.monotonic() - t_start:.0f}s elapsed",
+                flush=True,
+            )
+
+    if total_flaky:
+        print(f"Dropped {total_flaky} flaky (mutant, test) cells.")
+    if total_ceiling:
+        print(
+            f"{total_ceiling} mutants hit the {_STABLE_MAX_ATTEMPTS}-attempt "
+            f"stability ceiling (no two consecutive runs agreed)."
+        )
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pairs = pd.DataFrame(rows)
+    pairs.to_csv(out_dir / "pairs.csv", index=False)
+    faults = pd.DataFrame(fault_rows)
+    faults.to_csv(out_dir / "fault_labels.csv", index=False)
+    return {
+        "pairs_path": str(out_dir / "pairs.csv"),
+        "faults_path": str(out_dir / "fault_labels.csv"),
+        "num_rows": len(pairs),
+        "num_variants": len(pairs["source_version"].unique()) if len(pairs) else 0,
+        "num_faults": len(faults),
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=ROOT / "data",
+        help="directory to write pairs.csv and fault_labels.csv",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="parallel workers for the mutant executions (0 = auto)",
+    )
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help="discard cached per-version checkpoints for the current sampling "
+        "mode before building",
+    )
+    args = parser.parse_args()
+
+    if args.fresh:
+        import shutil
+
+        cache = WORK / "_checkpoints" / _sample_mode()
+        if cache.exists():
+            shutil.rmtree(cache)
+            print(f"Cleared checkpoints: {cache}")
+
+    workers = args.workers or min(os.cpu_count() or 4, 8)
+    summary = build_corpus(out_dir=args.out, workers=workers)
+    print(
+        f"Wrote {summary['num_rows']} pair rows across "
+        f"{summary['num_variants']} source versions and "
+        f"{summary['num_faults']} known fault lines."
+    )
+    print(f"Pairs:  {summary['pairs_path']}")
+    print(f"Faults: {summary['faults_path']}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

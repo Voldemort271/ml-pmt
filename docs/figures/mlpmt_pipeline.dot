@@ -1,0 +1,28 @@
+digraph MLPMT {
+  graph [rankdir=TB, fontname="Helvetica", fontsize=14, nodesep=0.25, ranksep=0.42, pad=0.10, bgcolor="white", newrank=true];
+  node [shape=box, style="rounded,filled", fillcolor="#F4F4F4", color="#666666", penwidth=1.0, fontname="Helvetica", fontsize=14, margin="0.10,0.07", height=0.50];
+  edge [color="#555555", penwidth=1.2, arrowsize=0.8, fontname="Helvetica", fontsize=12, constraint=false];
+
+  subgraph cluster_train {
+    label="Training (one-time)"; labeljust="l"; fontsize=14; color="#999999"; style="rounded,dashed"; margin=12;
+    { rank=same; T1; T2; T3; T4; }
+    T1 [label="Historical\nprograms"];
+    T2 [label="Execute\nmutants"];
+    T3 [label="Label\nflips"];
+    T4 [label="Train pair\nmodel"];
+    T1 -> T2 -> T3 -> T4;
+  }
+
+  subgraph cluster_infer {
+    label="Inference (per new bug)"; labeljust="l"; fontsize=14; color="#999999"; style="rounded,dashed"; margin=12;
+    { rank=same; I1; I2; I3; I4; }
+    I1 [label="New\nprogram"];
+    I2 [label="Baseline +\ncoverage"];
+    I3 [label="Generate\nmutants"];
+    I4 [label="Predict and\nrank lines"];
+    I1 -> I2 -> I3 -> I4;
+  }
+
+  T4 -> I4 [style=dashed, label="trained model", color="#333333", constraint=false];
+  T4 -> I1 [style=invis];
+}

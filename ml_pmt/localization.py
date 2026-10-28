@@ -1,0 +1,161 @@
+"""Ochiai-style ranking from predicted test–mutant outcome changes."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+
+import numpy as np
+import pandas as pd
+
+
+def rank_suspicious_lines(
+    pair_predictions: pd.DataFrame,
+    baseline_test_results: Mapping[str, str],
+    *,
+    universe: dict[int, float] | None = None,
+    aggregation: str = "mean",
+) -> pd.DataFrame:
+    """Rank source lines using expected per-test outcome-change probabilities.
+
+    ``pair_predictions`` must have ``line_number``, ``test_id``, and
+    ``probability`` columns. If multiple mutants target one line, their
+    probabilities are collapsed per (line, test) using ``aggregation``:
+
+    - ``"mean"`` (default): average probability. Robust to the number of
+      mutants per line; ``max`` over-inflates every line under dense sampling
+      (one spurious high prediction dominates), which empirically degrades MRR.
+    - ``"max"``: maximum probability (the original v1 behavior).
+
+    Tests absent from a line's prediction rows contribute 0.
+
+    When ``universe`` is given (``{line: ochiai_score}`` for the full covered
+    line set), lines with no mutants are appended with their Ochiai score as
+    the suspiciousness floor, so every covered line is ranked (B1a
+    full-universe scoring).
+    """
+    required = {"line_number", "test_id", "probability"}
+    missing = required.difference(pair_predictions.columns)
+    if missing:
+        raise ValueError(f"Missing prediction columns: {', '.join(sorted(missing))}")
+    if not baseline_test_results:
+        raise ValueError("At least one baseline test result is required")
+
+    baseline = {
+        str(test_id): str(result).strip().lower()
+        for test_id, result in baseline_test_results.items()
+    }
+    invalid_results = {
+        test_id: result
+        for test_id, result in baseline.items()
+        if result not in {"pass", "fail"}
+    }
+    if invalid_results:
+        raise ValueError(f"Baseline results must be 'pass' or 'fail': {invalid_results}")
+    failing_count = sum(result == "fail" for result in baseline.values())
+    if failing_count == 0:
+        raise ValueError("At least one baseline test must fail to localize a fault")
+
+    predictions = pair_predictions.loc[:, ["line_number", "test_id", "probability"]].copy()
+    has_file = "file" in pair_predictions.columns
+    if has_file:
+        predictions["file"] = pair_predictions["file"].astype(str)
+    if predictions.empty:
+        cols = (["file"] if has_file else []) + [
+            "line_number", "f_killed", "p_killed", "suspiciousness"
+        ]
+        return pd.DataFrame(columns=cols)
+    predictions["test_id"] = predictions["test_id"].astype(str)
+    unknown_tests = set(predictions["test_id"]).difference(baseline)
+    if unknown_tests:
+        raise ValueError(f"Predictions reference unknown tests: {sorted(unknown_tests)}")
+
+    line_numbers = pd.to_numeric(predictions["line_number"], errors="coerce")
+    if line_numbers.isna().any() or not line_numbers.ge(1).all():
+        raise ValueError("line_number must contain positive integers")
+    if not np.equal(line_numbers, np.floor(line_numbers)).all():
+        raise ValueError("line_number must contain positive integers")
+    predictions["line_number"] = line_numbers.astype(int)
+
+    probabilities = pd.to_numeric(predictions["probability"], errors="coerce")
+    if probabilities.isna().any() or not np.isfinite(probabilities).all():
+        raise ValueError("probability must contain finite numeric values")
+    if not probabilities.between(0, 1).all():
+        raise ValueError("probability values must be between 0 and 1")
+    predictions["probability"] = probabilities
+
+    # Collapse multiple mutants per (file, line, test) with the chosen
+    # aggregation. "mean" is robust to per-line mutant density; "max" matches
+    # the original v1 behavior but saturates under dense sampling.
+    group_cols = (["file"] if has_file else []) + ["line_number", "test_id"]
+    if aggregation == "mean":
+        collapsed = predictions.groupby(group_cols, as_index=False)["probability"].mean()
+    elif aggregation == "max":
+        collapsed = predictions.groupby(group_cols, as_index=False)["probability"].max()
+    else:
+        raise ValueError(f"Unknown aggregation {aggregation!r}")
+    rows: list[dict[str, float | int | str]] = []
+    for key, line_predictions in collapsed.groupby(
+        (["file", "line_number"] if has_file else ["line_number"])
+    ):
+        if has_file:
+            file, line_number = key
+        else:
+            line_number = key[0] if isinstance(key, tuple) else key
+            file = None
+        probabilities_by_test = line_predictions.set_index("test_id")["probability"]
+        failing_mass = sum(
+            float(probabilities_by_test.get(test_id, 0.0))
+            for test_id, result in baseline.items()
+            if result == "fail"
+        )
+        passing_mass = sum(
+            float(probabilities_by_test.get(test_id, 0.0))
+            for test_id, result in baseline.items()
+            if result == "pass"
+        )
+        denominator = np.sqrt(failing_count * (failing_mass + passing_mass))
+        score = failing_mass / denominator if denominator > 0 else 0.0
+        row: dict[str, float | int | str] = {
+            "line_number": int(line_number),
+            "f_killed": failing_mass,
+            "p_killed": passing_mass,
+            "suspiciousness": float(score),
+        }
+        if has_file:
+            row["file"] = file
+        rows.append(row)
+
+    sort_cols = (["file"] if has_file else []) + [
+        "suspiciousness", "f_killed", "p_killed", "line_number"
+    ]
+    asc = [True] if has_file else []
+    asc += [False, False, True, True]
+    ranked = pd.DataFrame(rows).sort_values(
+        sort_cols, ascending=asc, ignore_index=True
+    )
+    if universe:
+        # B1a fallback: merge in non-mutant covered lines. Kept consistent with
+        # ``apply_full_universe_floor``: each signal min-max normalized, then
+        # max fused. (The script path uses apply_full_universe_floor directly;
+        # this keeps the library self-consistent if called standalone.)
+        ranked["suspiciousness"] = _normalize(ranked["suspiciousness"])
+        covered = pd.DataFrame(
+            [{"line_number": line, "ochiai": score}
+             for line, score in universe.items()]
+        )
+        covered["ochiai"] = _normalize(covered["ochiai"])
+        merged = covered.merge(
+            ranked[["line_number", "suspiciousness"]], on="line_number", how="outer"
+        )
+        merged["suspiciousness"] = merged[["ochiai", "suspiciousness"]].max(axis=1)
+        return merged.loc[:, ["line_number", "suspiciousness"]].sort_values(
+            ["suspiciousness", "line_number"],
+            ascending=[False, True],
+            ignore_index=True,
+        )
+    return ranked
+
+
+def _normalize(series: "pd.Series") -> "pd.Series":
+    spread = series.max() - series.min()
+    return (series - series.min()) / spread if spread > 0 else series * 0.0

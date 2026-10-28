@@ -1,0 +1,29 @@
+{
+  "expressibility": {
+    "sampled_no_flip": 19,
+    "mutatable_only": 10,
+    "flipping": 10
+  },
+  "fault_lines": {
+    "total": 311,
+    "mutatable": 220,
+    "sampled": 88,
+    "flipping": 11
+  },
+  "cost_mean": {
+    "tests": 8.74,
+    "mutants": 274.95,
+    "mbfl_full_test_executions": 3003.18,
+    "mbfl_covering_test_executions": 1910.15,
+    "mlpmt_one_run_test_executions": 8.74,
+    "mlpmt_two_runs_test_executions": 17.49,
+    "sbfl_test_executions": 8.74,
+    "mbfl_suite_runs": 274.95,
+    "mlpmt_suite_runs": 1.0,
+    "sbfl_suite_runs": 1.0,
+    "mbfl_20_suite_runs": 20.0,
+    "mbfl_20_test_executions": 174.87,
+    "mbfl_30_suite_runs": 30.0,
+    "mbfl_30_test_executions": 262.31
+  }
+}
